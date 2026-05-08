@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="EdgeGist">
+  <rect width="512" height="512" rx="112" fill="#f7f8f6"/>
+  <path d="M342 126H182c-48 0-86 38-86 86v88c0 48 38 86 86 86h118" fill="none" stroke="#1b2a30" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M128 256h118" fill="none" stroke="#1b2a30" stroke-width="42" stroke-linecap="round"/>
+  <path d="M270 256h58c36 0 65 29 65 65" fill="none" stroke="#7da2cf" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="368" cy="377" r="22" fill="#7da2cf"/>
+</svg>
