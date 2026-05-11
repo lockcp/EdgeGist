@@ -48,7 +48,9 @@ export function internalError(message = 'Internal Server Error'): ApiError {
 }
 
 export function renderApiError(c: Context, error: unknown): Response {
-  const apiError = error instanceof ApiError ? error : internalError()
+  const apiError = error instanceof ApiError
+    ? error
+    : internalError(ownerCanSeeDiagnostic(c) ? `Internal Server Error: ${diagnosticMessage(error)}` : undefined)
   return c.json(
     {
       message: apiError.message,
@@ -57,4 +59,22 @@ export function renderApiError(c: Context, error: unknown): Response {
     },
     apiError.status,
   )
+}
+
+function ownerCanSeeDiagnostic(c: Context): boolean {
+  try {
+    return c.get('isOwner') === true
+  } catch {
+    return false
+  }
+}
+
+function diagnosticMessage(error: unknown): string {
+  if (error instanceof Error) return `${error.name}: ${error.message}`
+  if (typeof error === 'string') return error
+  try {
+    return JSON.stringify(error)
+  } catch {
+    return String(error)
+  }
 }

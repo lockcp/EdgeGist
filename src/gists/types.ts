@@ -48,6 +48,8 @@ export type GistVersionRecord = {
   changes: GistVersionFileChange[]
 }
 
+export type GistVersionRetentionRecord = Omit<GistVersionRecord, 'files'>
+
 export type CreateGistInput = {
   ownerLogin: string
   description: string
@@ -103,6 +105,7 @@ export type GistRepository = {
     changes: GistVersionFileChange[],
   ): Promise<GistVersionRecord>
   listVersions(gistId: string): Promise<GistVersionRecord[]>
+  listVersionsForRetention(gistId: string): Promise<GistVersionRetentionRecord[]>
   getVersion(gistId: string, sha: string): Promise<GistVersionRecord | null>
   pruneVersions(gistId: string, keepVersionIds: string[]): Promise<void>
 }

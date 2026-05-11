@@ -15,6 +15,8 @@ import type {
 
 type ParsedFileUpdate = NonNullable<UpdateGistInput['files']>[number]
 
+const maxD1TextOrRowBytes = 2_000_000
+
 export class GistService {
   constructor(
     private readonly repository: GistRepository,
@@ -94,6 +96,7 @@ function parseCreateFiles(files: unknown): Array<{ filename: string; content: st
   if (parsed.some((file) => isBlankContent(file.content))) {
     throw badRequest('Validation Failed: file content is required')
   }
+  parsed.forEach((file) => validateFileContentSize(file.filename, file.content))
   return parsed
 }
 
@@ -118,6 +121,7 @@ function parseUpdateFiles(files: unknown): ParsedFileUpdate[] {
     const hasFilename = Object.prototype.hasOwnProperty.call(spec, 'filename')
     const content = typeof spec.content === 'string' ? spec.content : undefined
     const filename = typeof spec.filename === 'string' ? spec.filename : previousFilename
+    if (content !== undefined) validateFileContentSize(filename, content)
     return {
       previousFilename,
       filename,
@@ -181,6 +185,25 @@ function isBlankFilename(value: string): boolean {
 
 function isBlankContent(value: string): boolean {
   return value.length === 0
+}
+
+function validateFileContentSize(filename: string, content: string): void {
+  const size = new TextEncoder().encode(content).length
+  if (size <= maxD1TextOrRowBytes) return
+  throw badRequest(
+    `Validation Failed: file ${formatFilenameForError(filename)} content is ${formatBytes(size)}, exceeding EdgeGist's D1 per-file limit of ${formatBytes(maxD1TextOrRowBytes)}`,
+  )
+}
+
+function formatFilenameForError(filename: string): string {
+  if (filename.length <= 80) return filename
+  return `${filename.slice(0, 77)}...`
+}
+
+function formatBytes(size: number): string {
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${(size / 1024 / 1024).toFixed(1)} MB`
 }
 
 function parseVisibility(payload: CreateGistRequest | UpdateGistRequest, fallback: GistVisibility) {

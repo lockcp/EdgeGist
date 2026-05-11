@@ -4,20 +4,22 @@ import type {
   GistVersionRecord,
 } from './types'
 
+type RetentionCandidate = Pick<GistVersionRecord, 'id' | 'versionIndex' | 'committedAt' | 'changes'>
+
 export async function applyRetention(
   repository: GistRepository,
   gistId: string,
   policy: RetentionPolicy,
 ): Promise<void> {
-  const versions = await repository.listVersions(gistId)
+  const versions = await repository.listVersionsForRetention(gistId)
   const keepVersionIds = selectVersionsToKeep(versions, policy).map((version) => version.id)
   await repository.pruneVersions(gistId, keepVersionIds)
 }
 
-export function selectVersionsToKeep(
-  versions: GistVersionRecord[],
+export function selectVersionsToKeep<T extends RetentionCandidate>(
+  versions: T[],
   policy: RetentionPolicy,
-): GistVersionRecord[] {
+): T[] {
   const sorted = [...versions].sort((left, right) => {
     const time = right.committedAt.localeCompare(left.committedAt)
     return time === 0 ? right.versionIndex - left.versionIndex : time
@@ -27,10 +29,10 @@ export function selectVersionsToKeep(
   return selectLatestVersions(sorted, policy.count)
 }
 
-function selectLatestVersions(
-  sortedVersions: GistVersionRecord[],
+function selectLatestVersions<T extends RetentionCandidate>(
+  sortedVersions: T[],
   count: number,
-): GistVersionRecord[] {
+): T[] {
   const changeCounts = new Map<string, number>()
   const renamedFileKeys = new Map<string, string>()
   const keepVersionIds = new Set<string>()

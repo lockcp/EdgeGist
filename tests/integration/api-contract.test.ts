@@ -1,6 +1,59 @@
 import { describe, expect, test } from 'bun:test'
+import type { D1DatabaseLike, D1PreparedStatement, D1Result } from '../../src/env'
 import { createApp } from '../../src/index'
 import { createTestEnv, createTestGist, ownerHeaders } from '../helpers'
+import { createMigratedTestD1 } from '../../src/testing/mock-d1'
+
+class QueryBudgetD1 implements D1DatabaseLike {
+  constructor(
+    private readonly db: D1DatabaseLike,
+    private remaining: number,
+  ) {}
+
+  prepare(query: string): D1PreparedStatement {
+    return new QueryBudgetStatement(this.db.prepare(query), () => this.charge(1))
+  }
+
+  async batch<T = unknown>(statements: D1PreparedStatement[]): Promise<D1Result<T>[]> {
+    this.charge(statements.length)
+    return this.db.batch(statements.map((statement) =>
+      statement instanceof QueryBudgetStatement ? statement.inner : statement,
+    ))
+  }
+
+  private charge(count: number): void {
+    this.remaining -= count
+    if (this.remaining < 0) {
+      throw new Error('D1 query budget exceeded')
+    }
+  }
+}
+
+class QueryBudgetStatement implements D1PreparedStatement {
+  constructor(
+    readonly inner: D1PreparedStatement,
+    private readonly charge: () => void,
+  ) {}
+
+  bind(...values: unknown[]): D1PreparedStatement {
+    return new QueryBudgetStatement(this.inner.bind(...values), this.charge)
+  }
+
+  async first<T = unknown>(): Promise<T | null> {
+    this.charge()
+    return this.inner.first<T>()
+  }
+
+  async all<T = unknown>(): Promise<D1Result<T>> {
+    this.charge()
+    return this.inner.all<T>()
+  }
+
+  async run(): Promise<D1Result> {
+    this.charge()
+    return this.inner.run()
+  }
+}
 
 describe('Gist API contract', () => {
   test('creates and reads a gist with GitHub-shaped metadata', async () => {
@@ -126,6 +179,30 @@ describe('Gist API contract', () => {
     })
   })
 
+  test('rejects files that exceed the D1 per-file storage limit', async () => {
+    const app = createApp()
+    const env = createTestEnv()
+
+    const response = await app.request(
+      '/gists',
+      {
+        method: 'POST',
+        headers: ownerHeaders(),
+        body: JSON.stringify({
+          files: {
+            'huge.txt': { content: 'x'.repeat(2_000_001) },
+          },
+        }),
+      },
+      env,
+    )
+
+    expect(response.status).toBe(400)
+    const body = (await response.json()) as Record<string, string>
+    expect(body.message).toContain('file huge.txt content is')
+    expect(body.message).toContain("exceeding EdgeGist's D1 per-file limit")
+  })
+
   test('allows whitespace-only filenames and content', async () => {
     const app = createApp()
     const env = createTestEnv()
@@ -163,6 +240,25 @@ describe('Gist API contract', () => {
     expect(status.ownerUsername).toBe('owner')
     expect(status.baseUrl).toBe('https://edgegist.test')
     expect(status.ownerToken).toBeUndefined()
+  })
+
+  test('includes internal diagnostics only for owner requests', async () => {
+    const app = createApp()
+    const ownerEnv = createTestEnv({ DB: new QueryBudgetD1(createMigratedTestD1(), 0) })
+    const ownerResponse = await app.request('/gists', { headers: ownerHeaders() }, ownerEnv)
+
+    expect(ownerResponse.status).toBe(500)
+    expect(await ownerResponse.json()).toMatchObject({
+      message: 'Internal Server Error: Error: D1 query budget exceeded',
+    })
+
+    const anonymousEnv = createTestEnv({ DB: new QueryBudgetD1(createMigratedTestD1(), 0) })
+    const anonymousResponse = await app.request('/gists/public', {}, anonymousEnv)
+
+    expect(anonymousResponse.status).toBe(500)
+    expect(await anonymousResponse.json()).toMatchObject({
+      message: 'Internal Server Error',
+    })
   })
 
   test('serves owner login session with optional Turnstile verification', async () => {
@@ -578,6 +674,44 @@ describe('Gist API contract', () => {
       status: 'deleted',
     })
     expect(commits[0]?.files.some((file) => file.filename === 'old.txt')).toBe(false)
+  })
+
+  test('updates many synced files within the D1 Free query budget', async () => {
+    const app = createApp()
+    const db = createMigratedTestD1()
+    const env = createTestEnv({ DB: db, EDGEGIST_HISTORY_MAX_VERSIONS: '5' })
+    const gist = await createTestGist(env)
+
+    let updated: Record<string, any> | null = null
+    for (let round = 1; round <= 8; round += 1) {
+      const files = Object.fromEntries(
+        Array.from({ length: 55 }, (_, index) => [
+          `artifact-${index}.conf`,
+          { content: `content-${index}-round-${round}` },
+        ]),
+      )
+
+      const updateResponse = await app.request(
+        `/gists/${gist.id}`,
+        {
+          method: 'PATCH',
+          headers: ownerHeaders(),
+          body: JSON.stringify({ files }),
+        },
+        {
+          ...env,
+          DB: new QueryBudgetD1(db, 50),
+        },
+      )
+
+      expect(updateResponse.status).toBe(200)
+      updated = (await updateResponse.json()) as Record<string, any>
+    }
+
+    if (!updated) throw new Error('Expected bulk sync update response')
+    expect(Object.keys(updated.files)).toHaveLength(56)
+    expect(updated.files['artifact-54.conf'].content).toBe('content-54-round-8')
+    expect(updated.history).toHaveLength(6)
   })
 
   test('rejects file rename collisions instead of overwriting existing files', async () => {

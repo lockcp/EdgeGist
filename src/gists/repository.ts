@@ -1,10 +1,11 @@
-import type { D1DatabaseLike } from '../env'
+import type { D1DatabaseLike, D1PreparedStatement } from '../env'
 import type {
   ChangeStatus,
   CreateGistInput,
   GistFileRecord,
   GistRecord,
   GistRepository,
+  GistVersionRetentionRecord,
   GistVersionFileChange,
   GistVersionRecord,
   GistVisibility,
@@ -54,6 +55,10 @@ type VersionFileRow = {
   truncated: number
 }
 
+type VersionFileWithVersionIdRow = VersionFileRow & {
+  version_id: string
+}
+
 type VersionFileChangeRow = {
   filename: string
   previous_filename: string | null
@@ -61,6 +66,16 @@ type VersionFileChangeRow = {
   additions: number
   deletions: number
 }
+
+type VersionFileChangeWithVersionIdRow = VersionFileChangeRow & {
+  version_id: string
+}
+
+type VersionIdRow = {
+  id: string
+}
+
+const maxD1BoundParameters = 100
 
 export class D1GistRepository implements GistRepository {
   constructor(private readonly db: D1DatabaseLike) {}
@@ -93,7 +108,7 @@ export class D1GistRepository implements GistRepository {
           gist.createdAt,
           gist.updatedAt,
         ),
-      ...gist.files.map((file) => this.insertFileStatement(gist.id, file)),
+      ...this.insertFileStatements(gist.id, gist.files),
     ])
 
     return gist
@@ -160,7 +175,7 @@ export class D1GistRepository implements GistRepository {
         )
         .bind(description, visibility, input.now, id),
       this.db.prepare('DELETE FROM gist_files WHERE gist_id = ?').bind(id),
-      ...nextFiles.map((file) => this.insertFileStatement(id, file)),
+      ...this.insertFileStatements(id, nextFiles),
     ])
 
     return {
@@ -236,41 +251,8 @@ export class D1GistRepository implements GistRepository {
           version.changeStatus.additions,
           version.changeStatus.deletions,
         ),
-      ...version.files.map((file) =>
-        this.db
-          .prepare(
-            `INSERT INTO gist_version_files (
-               version_id, filename, content, type, language, size, truncated
-             )
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          )
-          .bind(
-            version.id,
-            file.filename,
-            file.content,
-            file.type,
-            file.language,
-            file.size,
-            file.truncated ? 1 : 0,
-          ),
-      ),
-      ...version.changes.map((change) =>
-        this.db
-          .prepare(
-            `INSERT INTO gist_version_changes (
-               version_id, filename, previous_filename, status, additions, deletions
-             )
-             VALUES (?, ?, ?, ?, ?, ?)`,
-          )
-          .bind(
-            version.id,
-            change.filename,
-            change.previousFilename ?? null,
-            change.status,
-            change.additions,
-            change.deletions,
-          ),
-      ),
+      ...this.insertVersionFileStatements(version.id, version.files),
+      ...this.insertVersionChangeStatements(version.id, version.changes),
     ])
 
     return version
@@ -288,7 +270,53 @@ export class D1GistRepository implements GistRepository {
       .bind(gistId)
       .all<VersionRow>()
 
-    return Promise.all((rows.results ?? []).map((row) => this.hydrateVersion(row)))
+    const versions = rows.results ?? []
+    if (versions.length === 0) return []
+
+    const [files, changes] = await Promise.all([
+      this.db
+        .prepare(
+          `SELECT gist_version_files.version_id, filename, content, type, language, size, truncated
+           FROM gist_version_files
+           INNER JOIN gist_versions ON gist_versions.id = gist_version_files.version_id
+           WHERE gist_versions.gist_id = ?
+           ORDER BY filename ASC`,
+        )
+        .bind(gistId)
+        .all<VersionFileWithVersionIdRow>(),
+      this.listVersionChanges(gistId),
+    ])
+
+    const filesByVersionId = groupRowsByVersionId(files.results ?? [])
+    const changesByVersionId = groupRowsByVersionId(changes)
+
+    return versions.map((row) => ({
+      ...versionBaseFromRow(row),
+      files: (filesByVersionId.get(row.id) ?? []).map((file) => versionFileFromRow(file, row.committed_at)),
+      changes: (changesByVersionId.get(row.id) ?? []).map(versionFileChangeFromRow),
+    }))
+  }
+
+  async listVersionsForRetention(gistId: string): Promise<GistVersionRetentionRecord[]> {
+    const rows = await this.db
+      .prepare(
+        `SELECT id, gist_id, sha, version_index, description, committed_at,
+                change_status_total, change_status_additions, change_status_deletions
+         FROM gist_versions
+         WHERE gist_id = ?
+         ORDER BY committed_at DESC, version_index DESC`,
+      )
+      .bind(gistId)
+      .all<VersionRow>()
+
+    const versions = rows.results ?? []
+    if (versions.length === 0) return []
+
+    const changesByVersionId = groupRowsByVersionId(await this.listVersionChanges(gistId))
+    return versions.map((row) => ({
+      ...versionBaseFromRow(row),
+      changes: (changesByVersionId.get(row.id) ?? []).map(versionFileChangeFromRow),
+    }))
   }
 
   async getVersion(gistId: string, sha: string): Promise<GistVersionRecord | null> {
@@ -307,27 +335,49 @@ export class D1GistRepository implements GistRepository {
   }
 
   async pruneVersions(gistId: string, keepVersionIds: string[]): Promise<void> {
-    const allVersions = await this.listVersions(gistId)
+    const allVersions = await this.db
+      .prepare(
+        `SELECT id
+         FROM gist_versions
+         WHERE gist_id = ?`,
+      )
+      .bind(gistId)
+      .all<VersionIdRow>()
     const keep = new Set(keepVersionIds)
-    const toDelete = allVersions.filter((version) => !keep.has(version.id))
+    const toDelete = (allVersions.results ?? []).filter((version) => !keep.has(version.id))
     if (toDelete.length === 0) return
 
-    await this.db.batch(
-      toDelete.map((version) =>
-        this.db.prepare('DELETE FROM gist_versions WHERE id = ?').bind(version.id),
-      ),
-    )
+    await this.db.batch(this.deleteVersionStatements(gistId, toDelete.map((version) => version.id)))
   }
 
-  private insertFileStatement(gistId: string, file: GistFileRecord) {
-    return this.db
+  private async listVersionChanges(gistId: string): Promise<VersionFileChangeWithVersionIdRow[]> {
+    const changes = await this.db
       .prepare(
-        `INSERT INTO gist_files (
-           gist_id, filename, content, type, language, size, truncated, created_at, updated_at
-         )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `SELECT gist_version_changes.version_id, filename, previous_filename, status, additions, deletions
+         FROM gist_version_changes
+         INNER JOIN gist_versions ON gist_versions.id = gist_version_changes.version_id
+         WHERE gist_versions.gist_id = ?
+         ORDER BY filename ASC`,
       )
-      .bind(
+      .bind(gistId)
+      .all<VersionFileChangeWithVersionIdRow>()
+
+    return changes.results ?? []
+  }
+
+  private deleteVersionStatements(gistId: string, versionIds: string[]): D1PreparedStatement[] {
+    return chunkByBoundParameterLimit(versionIds, 1, 1).map((chunk) => {
+      const placeholders = chunk.map(() => '?').join(', ')
+      return this.db
+        .prepare(`DELETE FROM gist_versions WHERE gist_id = ? AND id IN (${placeholders})`)
+        .bind(gistId, ...chunk)
+    })
+  }
+
+  private insertFileStatements(gistId: string, files: GistFileRecord[]): D1PreparedStatement[] {
+    return chunkByBoundParameterLimit(files, 9).map((chunk) => {
+      const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')
+      const values = chunk.flatMap((file) => [
         gistId,
         file.filename,
         file.content,
@@ -337,7 +387,64 @@ export class D1GistRepository implements GistRepository {
         file.truncated ? 1 : 0,
         file.createdAt,
         file.updatedAt,
-      )
+      ])
+      return this.db
+        .prepare(
+          `INSERT INTO gist_files (
+             gist_id, filename, content, type, language, size, truncated, created_at, updated_at
+           )
+           VALUES ${placeholders}`,
+        )
+        .bind(...values)
+    })
+  }
+
+  private insertVersionFileStatements(versionId: string, files: GistFileRecord[]): D1PreparedStatement[] {
+    return chunkByBoundParameterLimit(files, 7).map((chunk) => {
+      const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?)').join(', ')
+      const values = chunk.flatMap((file) => [
+        versionId,
+        file.filename,
+        file.content,
+        file.type,
+        file.language,
+        file.size,
+        file.truncated ? 1 : 0,
+      ])
+      return this.db
+        .prepare(
+          `INSERT INTO gist_version_files (
+             version_id, filename, content, type, language, size, truncated
+           )
+           VALUES ${placeholders}`,
+        )
+        .bind(...values)
+    })
+  }
+
+  private insertVersionChangeStatements(
+    versionId: string,
+    changes: GistVersionFileChange[],
+  ): D1PreparedStatement[] {
+    return chunkByBoundParameterLimit(changes, 6).map((chunk) => {
+      const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?)').join(', ')
+      const values = chunk.flatMap((change) => [
+        versionId,
+        change.filename,
+        change.previousFilename ?? null,
+        change.status,
+        change.additions,
+        change.deletions,
+      ])
+      return this.db
+        .prepare(
+          `INSERT INTO gist_version_changes (
+             version_id, filename, previous_filename, status, additions, deletions
+           )
+           VALUES ${placeholders}`,
+        )
+        .bind(...values)
+    })
   }
 
   private async hydrateGist(row: GistRow, includeContent = true): Promise<GistRecord> {
@@ -516,6 +623,35 @@ function fileFromRow(row: GistFileRow): GistFileRecord {
   }
 }
 
+function versionBaseFromRow(row: VersionRow): Omit<GistVersionRecord, 'files' | 'changes'> {
+  return {
+    id: row.id,
+    gistId: row.gist_id,
+    sha: row.sha,
+    versionIndex: row.version_index,
+    description: row.description,
+    committedAt: row.committed_at,
+    changeStatus: {
+      total: row.change_status_total,
+      additions: row.change_status_additions,
+      deletions: row.change_status_deletions,
+    },
+  }
+}
+
+function versionFileFromRow(row: VersionFileRow, committedAt: string): GistFileRecord {
+  return {
+    filename: row.filename,
+    content: row.content,
+    type: row.type,
+    language: row.language,
+    size: row.size,
+    truncated: row.truncated === 1,
+    createdAt: committedAt,
+    updatedAt: committedAt,
+  }
+}
+
 function versionFileChangeFromRow(row: VersionFileChangeRow): GistVersionFileChange {
   return {
     filename: row.filename,
@@ -524,6 +660,19 @@ function versionFileChangeFromRow(row: VersionFileChangeRow): GistVersionFileCha
     additions: row.additions,
     deletions: row.deletions,
   }
+}
+
+function groupRowsByVersionId<T extends { version_id: string }>(rows: T[]): Map<string, T[]> {
+  const groups = new Map<string, T[]>()
+  for (const row of rows) {
+    const group = groups.get(row.version_id)
+    if (group) {
+      group.push(row)
+    } else {
+      groups.set(row.version_id, [row])
+    }
+  }
+  return groups
 }
 
 function applyFileUpdates(
@@ -575,6 +724,15 @@ function orderFilesByCreatedAt(files: GistFileRecord[]): GistFileRecord[] {
   return [...files].sort((left, right) =>
     right.createdAt.localeCompare(left.createdAt) || left.filename.localeCompare(right.filename),
   )
+}
+
+function chunkByBoundParameterLimit<T>(items: T[], parametersPerItem: number, reservedParameters = 0): T[][] {
+  const chunkSize = Math.max(1, Math.floor((maxD1BoundParameters - reservedParameters) / parametersPerItem))
+  const chunks: T[][] = []
+  for (let index = 0; index < items.length; index += chunkSize) {
+    chunks.push(items.slice(index, index + chunkSize))
+  }
+  return chunks
 }
 
 function inferMimeType(filename: string): string {
