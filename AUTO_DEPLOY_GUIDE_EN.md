@@ -1,49 +1,49 @@
-# EdgeGist 自动化同步与安全部署指南 (GitHub Actions 篇)
+# EdgeGist Automated Sync & Secure Deployment Guide (GitHub Actions)
 
-## 第一步：准备工作 (Cloudflare 端)
+## Step 1: Prerequisites (Cloudflare Side)
 
-在开始 GitHub 配置前，请先在 Cloudflare 完成以下三件事：
+Before configuring GitHub, please complete these three tasks in Cloudflare:
 
-### 1. 创建 D1 数据库
-1.  登录 Cloudflare，进入 **Workers & Pages > D1**。
-2.  点击 **Create database** -> **Dashboard**。
-3.  名字建议起为 `edge-gist`（或者您喜欢的名字）。
-4.  创建成功后，页面上会显示一个 **Database ID** (一串类似 `xxxx-xxxx...` 的字符)，**请记下它**。
+### 1. Create a D1 Database
+1.  Log in to Cloudflare, go to **Workers & Pages > D1**.
+2.  Click **Create database** -> **Dashboard**.
+3.  Name it `edge-gist` (or any name you prefer).
+4.  Once created, copy the **Database ID** (a string like `xxxx-xxxx...`). **Save it for later**.
 
-### 2. 创建 API 令牌 (Token)
-1.  进入 [My API Tokens](https://dash.cloudflare.com/profile/api-tokens)。
-2.  点击 **Create Token** -> 使用 **Edit Cloudflare Workers** 模板。
-3.  在权限 (Permissions) 列表中，**必须包含以下 5 项**：
+### 2. Create an API Token
+1.  Go to [My API Tokens](https://dash.cloudflare.com/profile/api-tokens).
+2.  Click **Create Token** -> Use the **Edit Cloudflare Workers** template.
+3.  In the permissions list, **ensure the following 5 are included**:
     *   `Account` - `Cloudflare Workers` - `Edit`
     *   `Account` - `Cloudflare Pages` - `Edit`
     *   `Account` - `D1` - `Edit`
     *   `Account` - `D1` - `Read`
     *   `Account` - `Account Analytics` - `Read`
-4.  保存并**记下生成的 Token 字符串**。
+4.  Save and **copy the generated Token string**.
 
-### 3. 清理旧脚本 (如果您是 Fork 用户)
-*   删除项目中的 `.github/workflows/release.yml` 文件，避免干扰。
+### 3. Cleanup Old Scripts (For Fork Users)
+*   Delete the `.github/workflows/release.yml` file from your project to avoid conflicts.
 
 ---
 
-## 第二步：配置 GitHub Secrets
+## Step 2: Configure GitHub Secrets
 
-在您的 GitHub 仓库：**Settings > Secrets and variables > Actions > New repository secret**。
+In your GitHub repository: **Settings > Secrets and variables > Actions > New repository secret**.
 
-| 密钥名称 | 说明 |
+| Secret Name | Description |
 | :--- | :--- |
-| `CLOUDFLARE_API_TOKEN` | 上一步创建的 API 令牌 |
-| `OWNER_USERNAME` | EdgeGist 登录用户名 |
-| `OWNER_PASSWORD` | EdgeGist 登录密码 |
-| `OWNER_TOKEN` | 管理 API Token |
-| `BASE_URL` | 部署地址 (如 `https://gist.your-name.workers.dev`) |
-| `D1_DATABASE_ID` | 上一步记下的 D1 Database ID |
+| `CLOUDFLARE_API_TOKEN` | The API Token created in the previous step |
+| `OWNER_USERNAME` | EdgeGist login username |
+| `OWNER_PASSWORD` | EdgeGist login password |
+| `OWNER_TOKEN` | Admin API Token |
+| `BASE_URL` | Deployment URL (e.g., `https://gist.your-name.workers.dev`) |
+| `D1_DATABASE_ID` | The D1 Database ID saved earlier |
 
 ---
 
-## 第三步：添加自动化脚本
+## Step 3: Add Automation Workflows
 
-### 1. 自动同步脚本 
+### 1. Auto-Sync Workflow
 `.github/workflows/sync.yml`
 ```yaml
 name: Sync Upstream
@@ -69,22 +69,22 @@ jobs:
           git checkout main
           git pull origin main --rebase
           
-          # 尝试正常合并
+          # Attempt normal merge
           if ! git merge upstream/main --no-edit; then
-            echo "发现冲突，开始自动保留本地配置..."
-            # 如果冲突，强制保留我们自己的 .github 文件夹
+            echo "Conflicts detected, auto-resolving to keep local configurations..."
+            # Keep our own .github directory
             git checkout HEAD -- .github/ || true
             git add .github/ || true
-            # 强制删除原作者的 release 脚本
+            # Remove upstream's release script if it conflicts
             git rm -rf .github/workflows/release.yml || true
-            # 提交合并
+            # Commit the merge
             git commit --no-edit
           fi
           
           git push origin main
 ```
 
-### 2. 自动部署脚本 
+### 2. Auto-Deploy Workflow
 `.github/workflows/deploy.yml`
 ```yaml
 name: Deploy
@@ -129,26 +129,26 @@ jobs:
 
 ---
 
-## 第四步：完成部署与 D1 绑定确认
+## Step 4: Finalize Deployment & D1 Binding
 
-1.  推送代码后，在 GitHub **Actions** 页面确认部署成功。
-2.  **检查绑定**：虽然脚本会尝试自动绑定，但建议进入 Cloudflare 控制台，在该 Worker 的 **Settings > Bindings** 中确认是否已有 D1 绑定：
+1.  After pushing the code, confirm the deployment was successful in the GitHub **Actions** tab.
+2.  **Verify Binding**: Although the script attempts to automate this, it's recommended to go to the Cloudflare dashboard, under **Settings > Bindings** for your Worker, and verify the D1 binding:
     *   Variable name: `DB`
-    *   D1 database: 选择您的 `edge-gist` 数据库。
-3.  点击保存并重新部署。
-4.  **地址访问**：访问 `https://[您的域名].workers.dev/[您的用户名]` 即可开始使用。
+    *   D1 database: Select your `edge-gist` database.
+3.  Save and redeploy if necessary.
+4.  **Access URL**: Visit `https://[your-domain].workers.dev/[your-username]` to start using EdgeGist.
 
 ---
 
-## 维护建议
-*   **手动即时同步 (推荐)**：
-    *   **方式 A (网页端)**：直接在您的 GitHub 仓库首页点击 **Sync fork** -> **Update branch**。这是最简单的方式。
-    *   **方式 B (Action 端)**：去 GitHub Actions 选 `Sync Upstream` -> `Run workflow` 手动运行脚本。
-*   **处理同步冲突**：如果自动同步任务报红，或者网页端提示 `Conflict` 无法同步，说明原作者有较大的代码变动导致无法自动合并。此时请在您的电脑本地执行以下命令强制对齐：
+## Maintenance Tips
+*   **Instant Manual Sync (Recommended)**:
+    *   **Method A (GitHub UI)**: Click **Sync fork** -> **Update branch** on your repo homepage.
+    *   **Method B (Actions)**: Go to Actions -> `Sync Upstream` -> `Run workflow`.
+*   **Handling Sync Conflicts**: If the sync fails or GitHub shows a `Conflict`, it means upstream changes cannot be automatically merged with yours. Run the following locally to force align:
     ```bash
     git fetch upstream
     git reset --hard upstream/main
-    # 重新添加您的 workflow 文件并推送
+    # Restore your workflow files and push
     git add .github/workflows/
     git commit -m "Fix sync conflict"
     git push origin main --force
