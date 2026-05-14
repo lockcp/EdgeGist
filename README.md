@@ -17,7 +17,7 @@ EdgeGist is API-first: deploy it, configure your owner token, and point Gist API
 
 ## Documentation
 
-- [EdgeGist Automated Sync and Secure Deployment Guide (GitHub Actions)](AUTO_DEPLOY_GUIDE.md) (written in Chinese) - thanks to [lockcp](https://github.com/lockcp) for providing this document.
+- [EdgeGist Automated Sync and Secure Deployment Guide (GitHub Actions)](doc/auto_deploy)  - thanks to [lockcp](https://github.com/lockcp) for providing this document.
 
 ## Community
 
